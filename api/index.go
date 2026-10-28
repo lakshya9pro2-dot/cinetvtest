@@ -71,6 +71,7 @@ func init() {
 	mobMfr = keys[mathrand.Intn(len(keys))]
 	models := brandModels[mobMfr]
 	mobModel = models[mathrand.Intn(len(models))]
+	log.Printf("[BOOT] NanoServer Go initialized. Emulated: %s %s (ID: %s)", mobMfr, mobModel, deviceId)
 }
 
 type TmdbInfo struct {
@@ -220,8 +221,10 @@ func httpsPost(endpoint string, formData, headers map[string]string) []byte {
 		data.Set(k, v)
 	}
 
+	start := time.Now()
 	req, err := http.NewRequest("POST", u, strings.NewReader(data.Encode()))
 	if err != nil {
+		log.Printf("[UPSTREAM POST ERROR] %s: %v", endpoint, err)
 		return nil
 	}
 
@@ -232,17 +235,20 @@ func httpsPost(endpoint string, formData, headers map[string]string) []byte {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("[UPSTREAM POST TIMEOUT/FAIL] %s: %v", endpoint, err)
 		return nil
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+	log.Printf("[UPSTREAM POST] %s -> Status: %d (%s)", endpoint, resp.StatusCode, time.Since(start))
 	return body
 }
 
 func invalidateToken() {
 	tokenLock.Lock()
 	defer tokenLock.Unlock()
+	log.Println("[AUTH] Token invalidated")
 	cachedToken = ""
 }
 
@@ -254,10 +260,12 @@ func fetchToken() string {
 		return cachedToken
 	}
 
+	log.Println("[AUTH] Requesting new session token from upstream (/api/public/init)...")
 	curTime := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	headers := buildHeaders(curTime, "")
 	buf := httpsPost("/api/public/init", map[string]string{"invited_by": "", "is_install": "1"}, headers)
 	if len(buf) == 0 {
+		log.Println("[AUTH ERROR] Upstream /api/public/init returned empty body")
 		return ""
 	}
 
@@ -273,11 +281,13 @@ func fetchToken() string {
 			if userInfo, ok := result["user_info"].(map[string]interface{}); ok {
 				if t, ok := userInfo["token"].(string); ok && t != "" {
 					cachedToken = t
+					log.Printf("[AUTH SUCCESS] Token acquired: %s...", cachedToken[:8])
 					return cachedToken
 				}
 			}
 		}
 	}
+	log.Printf("[AUTH ERROR] Failed to parse token: %s", jsonStr)
 	return ""
 }
 
@@ -292,11 +302,13 @@ func apiPost(endpoint string, formData map[string]string) map[string]interface{}
 	dec := aesDecrypt(strings.TrimSpace(string(buf)))
 	var result map[string]interface{}
 	if err := json.Unmarshal([]byte(dec), &result); err != nil {
+		log.Printf("[API ERROR] Unmarshal failed: %v", err)
 		return nil
 	}
 
 	// Retry once on unauthorized token
 	if code, ok := result["code"].(float64); ok && code == 401 {
+		log.Println("[API] Token unauthorized (401). Retrying with fresh token...")
 		invalidateToken()
 		token = fetchToken()
 		curTime = strconv.FormatInt(time.Now().UnixMilli(), 10)
@@ -311,6 +323,7 @@ func apiPost(endpoint string, formData map[string]string) map[string]interface{}
 }
 
 func getVodInfo(vodId string, audioType int) map[string]interface{} {
+	log.Printf("[VOD] Requesting vod details for ID: %s", vodId)
 	token := fetchToken()
 	curTime := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	buf := httpsPost(
@@ -324,17 +337,19 @@ func getVodInfo(vodId string, audioType int) map[string]interface{} {
 		buildHeaders(curTime, token),
 	)
 	if len(buf) == 0 {
+		log.Printf("[VOD ERROR] Empty response for VOD ID: %s", vodId)
 		return nil
 	}
 
 	dec := aesDecrypt(strings.TrimSpace(string(buf)))
 	var result map[string]interface{}
 	if err := json.Unmarshal([]byte(dec), &result); err != nil {
+		log.Printf("[VOD ERROR] Unmarshal failed: %v", err)
 		return nil
 	}
 
-	// Retry once on unauthorized token
 	if code, ok := result["code"].(float64); ok && code == 401 {
+		log.Println("[VOD] Token unauthorized (401). Retrying...")
 		invalidateToken()
 		token = fetchToken()
 		curTime = strconv.FormatInt(time.Now().UnixMilli(), 10)
@@ -356,6 +371,7 @@ func getVodInfo(vodId string, audioType int) map[string]interface{} {
 
 	if resObj, ok := result["result"].(map[string]interface{}); ok {
 		if collections, ok := resObj["vod_collection"].([]interface{}); ok {
+			log.Printf("[VOD SUCCESS] Found %d stream collection item(s)", len(collections))
 			for _, epIntf := range collections {
 				if ep, ok := epIntf.(map[string]interface{}); ok {
 					rawUrl, _ := ep["vod_url"].(string)
@@ -437,6 +453,7 @@ func parseTmdbMap(data map[string]interface{}, mediaType string) *TmdbInfo {
 
 func fetchTmdbDetails(id string, mediaType string) *TmdbInfo {
 	apiKey := getTmdbApiKey()
+	log.Printf("[TMDB] Fetching details for %s ID: %s", mediaType, id)
 	if strings.HasPrefix(id, "tt") {
 		findURL := fmt.Sprintf("https://api.themoviedb.org/3/find/%s?api_key=%s&external_source=imdb_id", id, apiKey)
 		jsonStr := httpGet(findURL, nil)
@@ -448,11 +465,17 @@ func fetchTmdbDetails(id string, mediaType string) *TmdbInfo {
 			movieResults, _ := findRes["movie_results"].([]interface{})
 
 			if mediaType == "tv" && len(tvResults) > 0 {
-				return parseTmdbMap(tvResults[0].(map[string]interface{}), "tv")
+				res := parseTmdbMap(tvResults[0].(map[string]interface{}), "tv")
+				log.Printf("[TMDB SUCCESS] Resolved IMDb %s -> TV '%s' (%s)", id, res.Title, res.Year)
+				return res
 			} else if len(movieResults) > 0 {
-				return parseTmdbMap(movieResults[0].(map[string]interface{}), "movie")
+				res := parseTmdbMap(movieResults[0].(map[string]interface{}), "movie")
+				log.Printf("[TMDB SUCCESS] Resolved IMDb %s -> Movie '%s' (%s)", id, res.Title, res.Year)
+				return res
 			} else if len(tvResults) > 0 {
-				return parseTmdbMap(tvResults[0].(map[string]interface{}), "tv")
+				res := parseTmdbMap(tvResults[0].(map[string]interface{}), "tv")
+				log.Printf("[TMDB SUCCESS] Resolved IMDb %s -> TV '%s' (%s)", id, res.Title, res.Year)
+				return res
 			}
 		}
 	}
@@ -463,10 +486,13 @@ func fetchTmdbDetails(id string, mediaType string) *TmdbInfo {
 		if jsonStr != "" {
 			var data map[string]interface{}
 			json.Unmarshal([]byte(jsonStr), &data)
-			return parseTmdbMap(data, mediaType)
+			res := parseTmdbMap(data, mediaType)
+			log.Printf("[TMDB SUCCESS] Resolved %s %s -> '%s' (%s)", mediaType, id, res.Title, res.Year)
+			return res
 		}
 	}
 
+	log.Printf("[TMDB ERROR] Could not find TMDB details for ID: %s", id)
 	return nil
 }
 
@@ -484,6 +510,7 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 }
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {
+	log.Printf("[HTTP %d] %s", status, message)
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
@@ -535,6 +562,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
         <li><code>GET /api/movie/{tmdb_id}</code> - Resolve movie stream (e.g., <code>/api/movie/550</code>)</li>
         <li><code>GET /api/tv/{tmdb_id}/{season}/{episode}</code> - Resolve TV episode stream (e.g., <code>/api/tv/1399/1/6</code>)</li>
         <li><code>GET /api/tmdb/movie/{tmdb_id}</code> - Fetch TMDB metadata</li>
+        <li><code>GET /api/health</code> - Diagnostics & connectivity test</li>
         <li><code>GET /api/test</code> - Upstream connection test</li>
     </ul>
     <h3>Query Parameter Alternatives</h3>
@@ -545,6 +573,33 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 </body>
 </html>`
 	w.Write([]byte(html))
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	token := fetchToken()
+	tmdb := fetchTmdbDetails("550", "movie")
+	res := map[string]interface{}{
+		"status":          "ok",
+		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		"emulated_device": fmt.Sprintf("%s %s (%s)", mobMfr, mobModel, deviceId),
+		"upstream": map[string]interface{}{
+			"host":           MAIN_URL,
+			"token_acquired": token != "",
+			"token_preview":  token[:min(8, len(token))] + "...",
+		},
+		"tmdb": map[string]interface{}{
+			"connected":    tmdb != nil,
+			"sample_title": tmdb != nil && tmdb.Title != "",
+		},
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func handleTmdbWithID(w http.ResponseWriter, r *http.Request, id string) {
@@ -559,15 +614,6 @@ func handleTmdbWithID(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, details)
 }
 
-func handleTmdb(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/tmdb/movie/")
-	id = strings.TrimPrefix(id, "/tmdb/movie/")
-	if id == "" {
-		id = r.URL.Query().Get("id")
-	}
-	handleTmdbWithID(w, r, id)
-}
-
 func handleTest(w http.ResponseWriter, r *http.Request) {
 	vodId := "1466695562"
 	vodDetails := getVodInfo(vodId, 0)
@@ -579,6 +625,7 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleMovieWithID(w http.ResponseWriter, r *http.Request, id string) {
+	log.Printf("[MOVIE] Processing request for TMDB ID: %s", id)
 	if id == "" {
 		id = "550"
 	}
@@ -591,22 +638,26 @@ func handleMovieWithID(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	// 2. Search for the title
+	log.Printf("[SEARCH] Querying upstream for '%s'...", tmdb.Title)
 	res := apiPost("/api/search/result", map[string]string{"kw": tmdb.Title, "pn": "1"})
 	vodId := extractVodId(res)
 
 	// Fallback: If no match and title has punctuation, try simplified title
 	if vodId == "" && (strings.Contains(tmdb.Title, ":") || strings.Contains(tmdb.Title, "-")) {
 		simpleTitle := strings.Split(strings.Split(tmdb.Title, ":")[0], "-")[0]
+		log.Printf("[SEARCH FALLBACK] Querying simplified title: '%s'...", strings.TrimSpace(simpleTitle))
 		res = apiPost("/api/search/result", map[string]string{"kw": strings.TrimSpace(simpleTitle), "pn": "1"})
 		vodId = extractVodId(res)
 	}
 
 	if vodId == "" {
+		log.Printf("[MOVIE NOT FOUND] Upstream search returned no results for '%s'", tmdb.Title)
 		writeJSONError(w, http.StatusNotFound, "Video not found on server")
 		return
 	}
 
 	// 3. Get Vod Info and extract signed URL
+	log.Printf("[MOVIE FOUND] Upstream VOD ID: %s. Resolving signed URL...", vodId)
 	vodDetails := getVodInfo(vodId, 0)
 	var signedUrl string
 	if vodDetails != nil {
@@ -622,10 +673,12 @@ func handleMovieWithID(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	if signedUrl == "" {
+		log.Printf("[MOVIE ERROR] Signed stream URL empty for VOD ID: %s", vodId)
 		writeJSONError(w, http.StatusNotFound, "Stream URL not available")
 		return
 	}
 
+	log.Printf("[MOVIE SUCCESS] Resolved stream URL for '%s': %s", tmdb.Title, signedUrl[:min(60, len(signedUrl))]+"...")
 	response := map[string]string{
 		"id":   id,
 		"name": tmdb.Title,
@@ -634,16 +687,9 @@ func handleMovieWithID(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-func handleMovie(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/movie/")
-	id = strings.TrimPrefix(id, "/movie/")
-	if id == "" {
-		id = r.URL.Query().Get("id")
-	}
-	handleMovieWithID(w, r, id)
-}
-
 func handleTvWithParams(w http.ResponseWriter, r *http.Request, id, season string, episode int) {
+	log.Printf("[TV] Processing request for TV ID: %s, Season: %s, Episode: %d", id, season, episode)
+
 	// 1. Get TMDB Details
 	tmdb := fetchTmdbDetails(id, "tv")
 	if tmdb == nil {
@@ -653,21 +699,25 @@ func handleTvWithParams(w http.ResponseWriter, r *http.Request, id, season strin
 
 	// 2. Search for the title + season
 	searchQuery := fmt.Sprintf("%s Season %s", tmdb.Title, season)
+	log.Printf("[TV SEARCH] Querying upstream for '%s'...", searchQuery)
 	res := apiPost("/api/search/result", map[string]string{"kw": searchQuery, "pn": "1"})
 	vodId := extractVodId(res)
 
 	// Fallback search to just the title
 	if vodId == "" {
+		log.Printf("[TV FALLBACK] Retrying search with title only: '%s'...", tmdb.Title)
 		res = apiPost("/api/search/result", map[string]string{"kw": tmdb.Title, "pn": "1"})
 		vodId = extractVodId(res)
 	}
 
 	if vodId == "" {
+		log.Printf("[TV NOT FOUND] Upstream search returned no results for '%s'", searchQuery)
 		writeJSONError(w, http.StatusNotFound, "Video not found on server")
 		return
 	}
 
 	// 3. Get Vod Info and extract signed URL for the specific episode
+	log.Printf("[TV FOUND] Upstream VOD ID: %s. Resolving episode %d...", vodId, episode)
 	vodDetails := getVodInfo(vodId, 0)
 	var signedUrl string
 	if vodDetails != nil {
@@ -692,10 +742,12 @@ func handleTvWithParams(w http.ResponseWriter, r *http.Request, id, season strin
 	}
 
 	if signedUrl == "" {
+		log.Printf("[TV ERROR] Episode %d not found in collection for VOD ID: %s", episode, vodId)
 		writeJSONError(w, http.StatusNotFound, "Episode not found")
 		return
 	}
 
+	log.Printf("[TV SUCCESS] Resolved stream URL for '%s' S%sE%d", tmdb.Title, season, episode)
 	response := map[string]string{
 		"id":      id,
 		"name":    tmdb.Title,
@@ -706,23 +758,9 @@ func handleTvWithParams(w http.ResponseWriter, r *http.Request, id, season strin
 	writeJSON(w, http.StatusOK, response)
 }
 
-func handleTv(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api/tv/")
-	path = strings.TrimPrefix(path, "/tv/")
-	parts := strings.Split(path, "/")
-	if len(parts) < 3 {
-		writeJSONError(w, http.StatusBadRequest, "Invalid format, use /api/tv/{id}/{season}/{episode}")
-		return
-	}
-
-	id := parts[0]
-	season := parts[1]
-	episode, _ := strconv.Atoi(parts[2])
-	handleTvWithParams(w, r, id, season, episode)
-}
-
 // Handler is the universal HTTP entry point for Vercel Functions, Netlify Functions, and Go serverless runtimes.
 func Handler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[REQ] %s %s", r.Method, r.URL.RequestURI())
 	addCorsHeaders(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -768,6 +806,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case cleanPath == "" || cleanPath == "api":
 		handleRoot(w, r)
+	case cleanPath == "health" || cleanPath == "debug":
+		handleHealth(w, r)
 	case cleanPath == "test":
 		handleTest(w, r)
 	case strings.HasPrefix(cleanPath, "tmdb/movie/"):
@@ -792,17 +832,5 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		handleRoot(w, r)
-	}
-}
-
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = strconv.Itoa(DefaultPort)
-	}
-
-	log.Printf("Server listening on port %s", port)
-	if err := http.ListenAndServe(":"+port, http.HandlerFunc(Handler)); err != nil {
-		log.Fatal(err)
 	}
 }

@@ -25,7 +25,6 @@ const BRAND_MODELS = {
   Realme: ["RMX3085", "RMX3360", "RMX3551"],
 };
 
-// Generate random device state for the worker isolate
 function randomHex(bytesLen) {
   const bytes = new Uint8Array(bytesLen);
   crypto.getRandomValues(bytes);
@@ -37,6 +36,8 @@ const brandKeys = Object.keys(BRAND_MODELS);
 const mobMfr = brandKeys[Math.floor(Math.random() * brandKeys.length)];
 const models = BRAND_MODELS[mobMfr];
 const mobModel = models[Math.floor(Math.random() * models.length)];
+
+console.log(`[BOOT] NanoServer Worker initialized. Emulated Device: ${mobMfr} ${mobModel} (ID: ${deviceId})`);
 
 let cachedToken = "";
 
@@ -260,7 +261,7 @@ async function aesDecrypt(encryptedBase64) {
 
     return new TextDecoder().decode(decryptedBytes);
   } catch (err) {
-    console.error("AES Decryption error:", err);
+    console.error("[DECRYPT ERROR]", err);
     return "";
   }
 }
@@ -298,35 +299,47 @@ function buildHeaders(curTime, token) {
 }
 
 async function httpsPost(endpoint, formData, headers) {
+  const startTime = Date.now();
   try {
     const params = new URLSearchParams();
     for (const [k, v] of Object.entries(formData)) {
       params.append(k, v);
     }
 
+    console.log(`[UPSTREAM POST] ${MAIN_URL}${endpoint} (data keys: ${Object.keys(formData).join(", ")})`);
     const res = await fetch(MAIN_URL + endpoint, {
       method: "POST",
       headers: headers,
       body: params.toString(),
     });
 
-    if (!res.ok) return "";
+    const elapsed = Date.now() - startTime;
+    console.log(`[UPSTREAM POST] ${endpoint} -> Status ${res.status} (${elapsed}ms)`);
+    if (!res.ok) {
+      console.error(`[UPSTREAM POST ERROR] ${endpoint} returned HTTP ${res.status}`);
+      return "";
+    }
     return await res.text();
   } catch (e) {
-    console.error("HTTP POST error:", e);
+    console.error(`[UPSTREAM POST EXCEPTION] ${endpoint}:`, e.message || e);
     return "";
   }
 }
 
 async function fetchToken() {
   if (cachedToken) {
+    console.log(`[AUTH] Using cached session token (${cachedToken.substring(0, 8)}...)`);
     return cachedToken;
   }
 
+  console.log(`[AUTH] Initializing new session token via /api/public/init...`);
   const curTime = Date.now().toString();
   const headers = buildHeaders(curTime, "");
   const text = await httpsPost("/api/public/init", { invited_by: "", is_install: "1" }, headers);
-  if (!text) return "";
+  if (!text) {
+    console.error(`[AUTH ERROR] Upstream /api/public/init returned empty body`);
+    return "";
+  }
 
   let jsonStr = text.trim();
   if (!jsonStr.startsWith("{")) {
@@ -338,10 +351,12 @@ async function fetchToken() {
     const token = parsed?.result?.user_info?.token;
     if (token) {
       cachedToken = token;
+      console.log(`[AUTH SUCCESS] New session token acquired: ${cachedToken.substring(0, 10)}...`);
       return cachedToken;
     }
+    console.error(`[AUTH ERROR] Response missing user_info.token:`, jsonStr.substring(0, 200));
   } catch (e) {
-    console.error("Token parse error:", e);
+    console.error(`[AUTH ERROR] JSON parse failure:`, e.message);
   }
   return "";
 }
@@ -356,6 +371,7 @@ async function apiPost(endpoint, formData) {
   try {
     let result = JSON.parse(dec);
     if (result?.code === 401) {
+      console.warn(`[API] Token unauthorized (code 401). Retrying with fresh token...`);
       cachedToken = "";
       token = await fetchToken();
       curTime = Date.now().toString();
@@ -367,11 +383,13 @@ async function apiPost(endpoint, formData) {
     }
     return result;
   } catch (e) {
+    console.error(`[API ERROR] Decrypt/parse failed for ${endpoint}:`, e.message);
     return null;
   }
 }
 
 async function getVodInfo(vodId, audioType = 0) {
+  console.log(`[VOD] Requesting vod details for ID: ${vodId}...`);
   let token = await fetchToken();
   let curTime = Date.now().toString();
   let resText = await httpsPost(
@@ -385,11 +403,15 @@ async function getVodInfo(vodId, audioType = 0) {
     buildHeaders(curTime, token)
   );
 
-  if (!resText) return null;
+  if (!resText) {
+    console.error(`[VOD ERROR] Empty response from /api/vod/info_new for ${vodId}`);
+    return null;
+  }
   let dec = await aesDecrypt(resText.trim());
   try {
     let result = JSON.parse(dec);
     if (result?.code === 401) {
+      console.warn(`[VOD] Token 401. Refreshing token...`);
       cachedToken = "";
       token = await fetchToken();
       curTime = Date.now().toString();
@@ -410,6 +432,8 @@ async function getVodInfo(vodId, audioType = 0) {
     }
 
     if (result?.result?.vod_collection) {
+      const count = result.result.vod_collection.length;
+      console.log(`[VOD SUCCESS] Found ${count} stream item(s) for VOD ID ${vodId}`);
       for (const ep of result.result.vod_collection) {
         const rawUrl = ep.vod_url || ep.down_url || "";
         ep.raw_url = rawUrl;
@@ -417,9 +441,12 @@ async function getVodInfo(vodId, audioType = 0) {
         if (ep.vod_url) ep.vod_url = signVideoUrl(ep.vod_url);
         if (ep.down_url) ep.down_url = signVideoUrl(ep.down_url);
       }
+    } else {
+      console.warn(`[VOD WARNING] No vod_collection found in response:`, JSON.stringify(result).substring(0, 200));
     }
     return result;
   } catch (e) {
+    console.error(`[VOD ERROR] Parse failure:`, e.message);
     return null;
   }
 }
@@ -453,6 +480,7 @@ function parseTmdbMap(data, mediaType) {
 
 async function fetchTmdbDetails(id, mediaType, apiKey) {
   const key = apiKey || DEFAULT_TMDB_KEY;
+  console.log(`[TMDB] Fetching details for ${mediaType} ID: ${id}...`);
   if (id.startsWith("tt")) {
     const findUrl = `https://api.themoviedb.org/3/find/${id}?api_key=${key}&external_source=imdb_id`;
     try {
@@ -462,14 +490,22 @@ async function fetchTmdbDetails(id, mediaType, apiKey) {
         const tvResults = findRes.tv_results || [];
         const movieResults = findRes.movie_results || [];
         if (mediaType === "tv" && tvResults.length > 0) {
-          return parseTmdbMap(tvResults[0], "tv");
+          const res = parseTmdbMap(tvResults[0], "tv");
+          console.log(`[TMDB SUCCESS] Resolved IMDb ${id} -> TV "${res.title}" (${res.year})`);
+          return res;
         } else if (movieResults.length > 0) {
-          return parseTmdbMap(movieResults[0], "movie");
+          const res = parseTmdbMap(movieResults[0], "movie");
+          console.log(`[TMDB SUCCESS] Resolved IMDb ${id} -> Movie "${res.title}" (${res.year})`);
+          return res;
         } else if (tvResults.length > 0) {
-          return parseTmdbMap(tvResults[0], "tv");
+          const res = parseTmdbMap(tvResults[0], "tv");
+          console.log(`[TMDB SUCCESS] Resolved IMDb ${id} -> TV "${res.title}" (${res.year})`);
+          return res;
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error(`[TMDB ERROR] IMDb lookup failed:`, e.message);
+    }
   }
 
   if (mediaType === "movie" || mediaType === "tv") {
@@ -478,9 +514,14 @@ async function fetchTmdbDetails(id, mediaType, apiKey) {
       const resp = await fetch(reqUrl, { headers: { "User-Agent": USER_AGENT } });
       if (resp.ok) {
         const data = await resp.json();
-        return parseTmdbMap(data, mediaType);
+        const res = parseTmdbMap(data, mediaType);
+        console.log(`[TMDB SUCCESS] Resolved TMDB ${id} -> "${res.title}" (${res.year})`);
+        return res;
       }
-    } catch (e) {}
+      console.error(`[TMDB ERROR] HTTP ${resp.status} for ${reqUrl}`);
+    } catch (e) {
+      console.error(`[TMDB ERROR] TMDB API lookup failed:`, e.message);
+    }
   }
   return null;
 }
@@ -505,6 +546,7 @@ function jsonResponse(data, status = 200) {
 }
 
 function errorResponse(message, status = 400) {
+  console.warn(`[HTTP ${status}] Returning error: ${message}`);
   return jsonResponse({ error: message }, status);
 }
 
@@ -512,11 +554,14 @@ function errorResponse(message, status = 400) {
 
 export default {
   async fetch(request, env = {}, ctx = {}) {
+    const startTime = Date.now();
+    const url = new URL(request.url);
+    console.log(`[REQ] ${request.method} ${url.pathname}${url.search}`);
+
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    const url = new URL(request.url);
     const rawPath = url.pathname;
     let cleanPath = rawPath.replace(/^\/+|\/+$/g, "");
     if (cleanPath.startsWith("api/")) {
@@ -526,6 +571,26 @@ export default {
     const tmdbApiKey = env.TMDB_KEY || DEFAULT_TMDB_KEY;
     const reqType = url.searchParams.get("type");
     const queryId = url.searchParams.get("id");
+
+    // Diagnostic health check
+    if (cleanPath === "health" || cleanPath === "debug") {
+      const token = await fetchToken();
+      const tmdbCheck = await fetchTmdbDetails("550", "movie", tmdbApiKey);
+      return jsonResponse({
+        status: "ok",
+        timestamp: new Date().toISOString(),
+        emulated_device: `${mobMfr} ${mobModel} (${deviceId})`,
+        upstream: {
+          host: MAIN_URL,
+          token_acquired: Boolean(token),
+          token_preview: token ? `${token.substring(0, 8)}...` : null,
+        },
+        tmdb: {
+          connected: Boolean(tmdbCheck),
+          sample_title: tmdbCheck?.title || null,
+        },
+      });
+    }
 
     // 1. Query parameter routing (?type=movie&id=550 or ?type=tv&id=1399&season=1&episode=6)
     if (reqType === "movie" && queryId) {
@@ -558,6 +623,7 @@ export default {
         <li><code>GET /api/movie/{tmdb_id}</code> - Resolve movie stream (e.g. <code>/api/movie/550</code>)</li>
         <li><code>GET /api/tv/{tmdb_id}/{season}/{episode}</code> - Resolve TV episode stream (e.g. <code>/api/tv/1399/1/6</code>)</li>
         <li><code>GET /api/tmdb/movie/{tmdb_id}</code> - Fetch TMDB metadata</li>
+        <li><code>GET /api/health</code> - Diagnostics & connectivity test</li>
         <li><code>GET /api/test</code> - Upstream connection test</li>
     </ul>
 </body>
@@ -606,25 +672,31 @@ export default {
 };
 
 async function handleMovieRequest(id, tmdbApiKey) {
+  console.log(`[MOVIE] Resolving stream for movie ID: ${id}`);
   const tmdb = await fetchTmdbDetails(id, "movie", tmdbApiKey);
   if (!tmdb) {
+    console.error(`[MOVIE ERROR] TMDB details not found for ID: ${id}`);
     return errorResponse("TMDB info not found", 404);
   }
 
-  let res = await apiPost("/api/search/result", { kw: tmdb.Title || tmdb.title, pn: "1" });
+  const title = tmdb.Title || tmdb.title;
+  console.log(`[MOVIE SEARCH] Querying upstream for: "${title}"`);
+  let res = await apiPost("/api/search/result", { kw: title, pn: "1" });
   let vodId = extractVodId(res);
 
-  const title = tmdb.Title || tmdb.title;
   if (!vodId && (title.includes(":") || title.includes("-"))) {
     const simpleTitle = title.split(":")[0].split("-")[0].trim();
+    console.log(`[MOVIE FALLBACK] Retrying search with simplified title: "${simpleTitle}"`);
     res = await apiPost("/api/search/result", { kw: simpleTitle, pn: "1" });
     vodId = extractVodId(res);
   }
 
   if (!vodId) {
+    console.warn(`[MOVIE NOT FOUND] Upstream search returned no results for "${title}"`);
     return errorResponse("Video not found on server", 404);
   }
 
+  console.log(`[MOVIE FOUND] Upstream VOD ID: ${vodId}. Fetching stream URL...`);
   const vodDetails = await getVodInfo(vodId, 0);
   let signedUrl = "";
   if (vodDetails?.result?.vod_collection && vodDetails.result.vod_collection.length > 0) {
@@ -632,9 +704,11 @@ async function handleMovieRequest(id, tmdbApiKey) {
   }
 
   if (!signedUrl) {
+    console.error(`[MOVIE ERROR] Stream URL not available for VOD ID ${vodId}`);
     return errorResponse("Stream URL not available", 404);
   }
 
+  console.log(`[MOVIE SUCCESS] Resolved stream URL for "${title}": ${signedUrl.substring(0, 60)}...`);
   return jsonResponse({
     id: id,
     name: title,
@@ -643,25 +717,31 @@ async function handleMovieRequest(id, tmdbApiKey) {
 }
 
 async function handleTvRequest(id, season, episode, tmdbApiKey) {
+  console.log(`[TV] Resolving stream for TV show ID: ${id}, Season ${season}, Episode ${episode}`);
   const tmdb = await fetchTmdbDetails(id, "tv", tmdbApiKey);
   if (!tmdb) {
+    console.error(`[TV ERROR] TMDB details not found for TV ID: ${id}`);
     return errorResponse("TMDB info not found", 404);
   }
 
   const title = tmdb.Title || tmdb.title;
   const searchQuery = `${title} Season ${season}`;
+  console.log(`[TV SEARCH] Querying upstream for: "${searchQuery}"`);
   let res = await apiPost("/api/search/result", { kw: searchQuery, pn: "1" });
   let vodId = extractVodId(res);
 
   if (!vodId) {
+    console.log(`[TV FALLBACK] Retrying search with title only: "${title}"`);
     res = await apiPost("/api/search/result", { kw: title, pn: "1" });
     vodId = extractVodId(res);
   }
 
   if (!vodId) {
+    console.warn(`[TV NOT FOUND] Upstream search returned no results for "${searchQuery}"`);
     return errorResponse("Video not found on server", 404);
   }
 
+  console.log(`[TV FOUND] Upstream VOD ID: ${vodId}. Fetching episode ${episode}...`);
   const vodDetails = await getVodInfo(vodId, 0);
   let signedUrl = "";
   if (vodDetails?.result?.vod_collection) {
@@ -675,9 +755,11 @@ async function handleTvRequest(id, season, episode, tmdbApiKey) {
   }
 
   if (!signedUrl) {
+    console.error(`[TV ERROR] Episode ${episode} not found in collection for VOD ID ${vodId}`);
     return errorResponse("Episode not found", 404);
   }
 
+  console.log(`[TV SUCCESS] Resolved stream URL for "${title}" S${season}E${episode}: ${signedUrl.substring(0, 60)}...`);
   return jsonResponse({
     id: id,
     name: title,
