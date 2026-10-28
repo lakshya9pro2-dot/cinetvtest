@@ -19,31 +19,20 @@ const GAID = "";
 const P2P_SALT = "Zox882LYjEn4Rqpa";
 const DEFAULT_TMDB_KEY = "e6333b32409e02a4a6eba6fb7ff866bb";
 
-const BRAND_MODELS = {
-  Samsung: ["SM-S918B", "SM-A528B", "SM-M336B"],
-  Xiaomi: ["2201117TI", "M2012K11AI", "Redmi Note 11"],
-  OnePlus: ["LE2111", "CPH2449", "IN2023"],
-  Google: ["Pixel 6", "Pixel 7", "Pixel 8"],
-  Realme: ["RMX3085", "RMX3360", "RMX3551"],
-};
+// Stable pre-registered device profile & session token
+const DEFAULT_DEVICE_ID = "511823550d113944a1db38c93aeb95d6";
+const DEFAULT_TOKEN = "gAAAAABq4bOqDhy8xJRscb7PcWvu1XclowGNCpvjAnTMWqtxdb353tgMz8lhuXu4bvQPdQenJ3KWPvgme8Zqanzxo21O9q9aGjC6t_dsNELuDDmMnnqWkgjIbxUgV4emBAHuLVwH5Y7FEZeHaQwAEQ50VyG5s6Ba9Uycr_9pDD-4k5Jb6x7Q48puopgD2S9Yfw8uGGj1tO45qEMmkp-nEyRDj-uvtmjz_vY8YWIpHwRTdDKHt-9hdgKrC9J-kSWTvYwe5cDOpAUa";
+const DEFAULT_MOB_MFR = "OnePlus";
+const DEFAULT_MOB_MODEL = "CPH2449";
 
-function randomHex(bytesLen) {
-  const bytes = new Uint8Array(bytesLen);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
+let deviceId = DEFAULT_DEVICE_ID;
+let mobMfr = DEFAULT_MOB_MFR;
+let mobModel = DEFAULT_MOB_MODEL;
+let cachedToken = DEFAULT_TOKEN;
 
-const deviceId = randomHex(16);
-const brandKeys = Object.keys(BRAND_MODELS);
-const mobMfr = brandKeys[Math.floor(Math.random() * brandKeys.length)];
-const models = BRAND_MODELS[mobMfr];
-const mobModel = models[Math.floor(Math.random() * models.length)];
+console.log(`[BOOT] NanoServer Worker initialized with Device: ${mobMfr} ${mobModel} (ID: ${deviceId})`);
 
-console.log(`[BOOT] NanoServer Worker initialized. Emulated Device: ${mobMfr} ${mobModel} (ID: ${deviceId})`);
-
-let cachedToken = "";
-
-// ─── MD5 Implementation (Hardware/node:crypto with zero-dep fallback) ─────────
+// ─── MD5 Implementation (Hardware/node:crypto with fallback) ──────────────────
 
 function pureJsMd5(string) {
   function rotateLeft(lValue, iShiftBits) {
@@ -196,13 +185,11 @@ function md5(str) {
 // ─── Cryptographic & Signing Helpers ─────────────────────────────────────────
 
 function generateSign(curTime) {
-  const hash = md5(SECRET + deviceId + curTime).toUpperCase();
-  return hash;
+  return md5(SECRET + deviceId + curTime).toUpperCase();
 }
 
 function generateP2pToken(vodId, curTime) {
-  const hash = md5(P2P_SALT + deviceId + vodId + curTime).toUpperCase();
-  return hash;
+  return md5(P2P_SALT + deviceId + vodId + curTime).toUpperCase();
 }
 
 function signVideoUrl(videoUrl) {
@@ -292,7 +279,7 @@ function buildHeaders(curTime, token) {
     sign: sign,
     sys_platform: "2",
     sysrelease: "13",
-    token: token || "",
+    token: token || cachedToken || "",
     "User-Agent": "okhttp/4.11.0",
     version: "30000",
   };
@@ -326,18 +313,19 @@ async function httpsPost(endpoint, formData, headers) {
   }
 }
 
-async function fetchToken() {
-  if (cachedToken) {
+async function fetchToken(forceRefresh = false) {
+  if (!forceRefresh && cachedToken) {
+    console.log(`[AUTH] Using active session token (${cachedToken.substring(0, 10)}...)`);
     return cachedToken;
   }
 
-  console.log(`[AUTH] Initializing new session token via /api/public/init...`);
+  console.log(`[AUTH] Requesting session token from /api/public/init...`);
   const curTime = Date.now().toString();
   const headers = buildHeaders(curTime, "");
   const text = await httpsPost("/api/public/init", { invited_by: "", is_install: "1" }, headers);
   if (!text) {
-    console.error(`[AUTH ERROR] Upstream /api/public/init returned empty body`);
-    return "";
+    console.warn(`[AUTH] Upstream /api/public/init returned empty. Falling back to default token.`);
+    return cachedToken || DEFAULT_TOKEN;
   }
 
   let jsonStr = text.trim();
@@ -353,11 +341,11 @@ async function fetchToken() {
       console.log(`[AUTH SUCCESS] New session token acquired: ${cachedToken.substring(0, 10)}...`);
       return cachedToken;
     }
-    console.error(`[AUTH ERROR] Response missing user_info.token:`, jsonStr.substring(0, 200));
+    console.warn(`[AUTH] Upstream init failed: ${jsonStr.substring(0, 100)}. Using stable token.`);
   } catch (e) {
     console.error(`[AUTH ERROR] JSON parse failure:`, e.message);
   }
-  return "";
+  return cachedToken || DEFAULT_TOKEN;
 }
 
 async function apiPost(endpoint, formData) {
@@ -370,9 +358,9 @@ async function apiPost(endpoint, formData) {
   try {
     let result = JSON.parse(dec);
     if (result?.code === 401) {
-      console.warn(`[API] Token unauthorized (code 401). Retrying with fresh token...`);
+      console.warn(`[API] Token 401 unauthorized. Refreshing token...`);
       cachedToken = "";
-      token = await fetchToken();
+      token = await fetchToken(true);
       curTime = Date.now().toString();
       resText = await httpsPost(endpoint, formData, buildHeaders(curTime, token));
       if (resText) {
@@ -410,9 +398,8 @@ async function getVodInfo(vodId, audioType = 0) {
   try {
     let result = JSON.parse(dec);
     if (result?.code === 401) {
-      console.warn(`[VOD] Token 401. Refreshing token...`);
-      cachedToken = "";
-      token = await fetchToken();
+      console.warn(`[VOD] Token 401 unauthorized. Refreshing token...`);
+      token = await fetchToken(true);
       curTime = Date.now().toString();
       resText = await httpsPost(
         "/api/vod/info_new",
@@ -441,7 +428,7 @@ async function getVodInfo(vodId, audioType = 0) {
         if (ep.down_url) ep.down_url = signVideoUrl(ep.down_url);
       }
     } else {
-      console.warn(`[VOD WARNING] No vod_collection found in response:`, JSON.stringify(result).substring(0, 200));
+      console.warn(`[VOD WARNING] Response:`, JSON.stringify(result).substring(0, 150));
     }
     return result;
   } catch (e) {
@@ -572,6 +559,9 @@ export default {
       cleanPath = cleanPath.slice(4);
     }
 
+    // Allow custom environment overrides
+    if (env.DEVICE_ID) deviceId = env.DEVICE_ID;
+    if (env.TOKEN) cachedToken = env.TOKEN;
     const tmdbApiKey = env.TMDB_KEY || DEFAULT_TMDB_KEY;
     const reqType = url.searchParams.get("type");
     const queryId = url.searchParams.get("id");
@@ -587,7 +577,7 @@ export default {
         upstream: {
           host: MAIN_URL,
           token_acquired: Boolean(token),
-          token_preview: token ? `${token.substring(0, 8)}...` : null,
+          token_preview: token ? `${token.substring(0, 10)}...` : null,
         },
         tmdb: {
           connected: Boolean(tmdbCheck),

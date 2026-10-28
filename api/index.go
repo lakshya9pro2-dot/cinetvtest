@@ -7,14 +7,12 @@ import (
 	"crypto/cipher"
 	"crypto/des"
 	"crypto/md5"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	mathrand "math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,6 +40,10 @@ const (
 	GAID                 = ""
 	P2P_SALT             = "Zox882LYjEn4Rqpa"
 	TMDB_KEY             = "e6333b32409e02a4a6eba6fb7ff866bb"
+	DEFAULT_DEVICE_ID    = "511823550d113944a1db38c93aeb95d6"
+	DEFAULT_TOKEN        = "gAAAAABq4bOqDhy8xJRscb7PcWvu1XclowGNCpvjAnTMWqtxdb353tgMz8lhuXu4bvQPdQenJ3KWPvgme8Zqanzxo21O9q9aGjC6t_dsNELuDDmMnnqWkgjIbxUgV4emBAHuLVwH5Y7FEZeHaQwAEQ50VyG5s6Ba9Uycr_9pDD-4k5Jb6x7Q48puopgD2S9Yfw8uGGj1tO45qEMmkp-nEyRDj-uvtmjz_vY8YWIpHwRTdDKHt-9hdgKrC9J-kSWTvYwe5cDOpAUa"
+	DEFAULT_MOB_MFR      = "OnePlus"
+	DEFAULT_MOB_MODEL    = "CPH2449"
 )
 
 var (
@@ -60,17 +62,16 @@ var (
 )
 
 func init() {
-	b := make([]byte, 16)
-	rand.Read(b)
-	deviceId = hex.EncodeToString(b)
-
-	var keys []string
-	for k := range brandModels {
-		keys = append(keys, k)
+	deviceId = os.Getenv("DEVICE_ID")
+	if deviceId == "" {
+		deviceId = DEFAULT_DEVICE_ID
 	}
-	mobMfr = keys[mathrand.Intn(len(keys))]
-	models := brandModels[mobMfr]
-	mobModel = models[mathrand.Intn(len(models))]
+	cachedToken = os.Getenv("TOKEN")
+	if cachedToken == "" {
+		cachedToken = DEFAULT_TOKEN
+	}
+	mobMfr = DEFAULT_MOB_MFR
+	mobModel = DEFAULT_MOB_MODEL
 	log.Printf("[BOOT] NanoServer Go initialized. Emulated: %s %s (ID: %s)", mobMfr, mobModel, deviceId)
 }
 
@@ -265,8 +266,9 @@ func fetchToken() string {
 	headers := buildHeaders(curTime, "")
 	buf := httpsPost("/api/public/init", map[string]string{"invited_by": "", "is_install": "1"}, headers)
 	if len(buf) == 0 {
-		log.Println("[AUTH ERROR] Upstream /api/public/init returned empty body")
-		return ""
+		log.Println("[AUTH WARN] Upstream /api/public/init empty. Using stable token.")
+		cachedToken = DEFAULT_TOKEN
+		return cachedToken
 	}
 
 	text := strings.TrimSpace(string(buf))
@@ -287,8 +289,9 @@ func fetchToken() string {
 			}
 		}
 	}
-	log.Printf("[AUTH ERROR] Failed to parse token: %s", jsonStr)
-	return ""
+	log.Printf("[AUTH WARN] Failed to extract token from upstream: %s. Using stable token.", jsonStr[:min(60, len(jsonStr))])
+	cachedToken = DEFAULT_TOKEN
+	return cachedToken
 }
 
 func apiPost(endpoint string, formData map[string]string) map[string]interface{} {

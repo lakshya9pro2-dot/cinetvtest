@@ -130,3 +130,5 @@ curl -s http://localhost:1937/api/tv/1399/1/6
 ## Environment Variables
 - `PORT`: (Optional) Port for local/standalone execution (default: `1937`).
 - `TMDB_KEY`: (Optional) Custom The Movie Database API key (default key included).
+- `DEVICE_ID`: (Optional) Custom pre-registered emulated device ID.
+- `TOKEN`: (Optional) Custom upstream session token.
