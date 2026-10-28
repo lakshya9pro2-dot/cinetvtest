@@ -1,0 +1,7 @@
+name = "nanoserver-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Optional environment variables
+# [vars]
+# TMDB_KEY = "your_tmdb_key_here"

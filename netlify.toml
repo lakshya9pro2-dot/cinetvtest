@@ -1,0 +1,11 @@
+[build]
+  command = "go build -o functions/server main.go"
+  publish = "public"
+
+[functions]
+  directory = "functions"
+
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/server"
+  status = 200
