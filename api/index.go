@@ -777,6 +777,12 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	reqType := query.Get("type")
 
+	// Fast return on favicon.ico
+	if cleanPath == "favicon.ico" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// 1. Query parameter routing (?type=movie&id=550 or ?type=tv&id=1399&season=1&episode=6)
 	if reqType == "movie" && query.Get("id") != "" {
 		handleMovieWithID(w, r, query.Get("id"))

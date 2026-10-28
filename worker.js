@@ -3,6 +3,8 @@
  * Compatible with: Cloudflare Workers, Vercel Edge, Netlify Edge
  */
 
+import { createHash } from "node:crypto";
+
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const SECRET = "47Q8tBqO4YqrMHf4";
 const AES_KEY_STR = "0123456789123456";
@@ -41,89 +43,72 @@ console.log(`[BOOT] NanoServer Worker initialized. Emulated Device: ${mobMfr} ${
 
 let cachedToken = "";
 
-// ─── MD5 Implementation (RFC 1321 standard, zero dependency) ─────────────────
+// ─── MD5 Implementation (Hardware/node:crypto with zero-dep fallback) ─────────
 
-function md5(string) {
+function pureJsMd5(string) {
   function rotateLeft(lValue, iShiftBits) {
     return (lValue << iShiftBits) | (lValue >>> (32 - iShiftBits));
   }
   function addUnsigned(lX, lY) {
-    var lX4, lY4, lX8, lY8, lResult;
-    lX8 = lX & 0x80000000;
-    lY8 = lY & 0x80000000;
-    lX4 = lX & 0x40000000;
-    lY4 = lY & 0x40000000;
-    lResult = (lX & 0x3fffffff) + (lY & 0x3fffffff);
-    if (lX4 & lY4) return lResult ^ 0x80000000 ^ lX8 ^ lY8;
-    if (lX4 | lY4) {
-      if (lResult & 0x40000000) return lResult ^ 0xc0000000 ^ lX8 ^ lY8;
-      else return lResult ^ 0x40000000 ^ lX8 ^ lY8;
-    } else {
-      return lResult ^ lX8 ^ lY8;
-    }
+    return ((lX + lY) & 0xffffffff) >>> 0;
   }
   function F(x, y, z) { return (x & y) | (~x & z); }
   function G(x, y, z) { return (x & z) | (y & ~z); }
   function H(x, y, z) { return x ^ y ^ z; }
   function I(x, y, z) { return y ^ (x | ~z); }
   function FF(a, b, c, d, x, s, ac) {
-    a = addUnsigned(a, addUnsigned(addUnsigned(F(b, c, d), x), ac));
+    a = addUnsigned(a, addUnsigned(addUnsigned(F(b, c, d), x || 0), ac));
     return addUnsigned(rotateLeft(a, s), b);
   }
   function GG(a, b, c, d, x, s, ac) {
-    a = addUnsigned(a, addUnsigned(addUnsigned(G(b, c, d), x), ac));
+    a = addUnsigned(a, addUnsigned(addUnsigned(G(b, c, d), x || 0), ac));
     return addUnsigned(rotateLeft(a, s), b);
   }
   function HH(a, b, c, d, x, s, ac) {
-    a = addUnsigned(a, addUnsigned(addUnsigned(H(b, c, d), x), ac));
+    a = addUnsigned(a, addUnsigned(addUnsigned(H(b, c, d), x || 0), ac));
     return addUnsigned(rotateLeft(a, s), b);
   }
   function II(a, b, c, d, x, s, ac) {
-    a = addUnsigned(a, addUnsigned(addUnsigned(I(b, c, d), x), ac));
+    a = addUnsigned(a, addUnsigned(addUnsigned(I(b, c, d), x || 0), ac));
     return addUnsigned(rotateLeft(a, s), b);
   }
   function convertToWordArray(str) {
-    var lWordCount;
-    var lMessageLength = str.length;
-    var lNumberOfWords_temp1 = lMessageLength + 8;
-    var lNumberOfWords_temp2 = (lNumberOfWords_temp1 - (lNumberOfWords_temp1 % 64)) / 64;
-    var lNumberOfWords = (lNumberOfWords_temp2 + 1) * 16;
-    var lWordArray = Array(lNumberOfWords - 1);
-    var lBytePosition = 0;
-    var lByteCount = 0;
-    while (lByteCount < lMessageLength) {
-      lWordCount = (lByteCount - (lByteCount % 4)) / 4;
-      lBytePosition = (lByteCount % 4) * 8;
-      lWordArray[lWordCount] = lWordArray[lWordCount] | (str.charCodeAt(lByteCount) << lBytePosition);
-      lByteCount++;
+    const lMessageLength = str.length;
+    const lNumberOfWords_temp1 = lMessageLength + 8;
+    const lNumberOfWords_temp2 = (lNumberOfWords_temp1 - (lNumberOfWords_temp1 % 64)) / 64;
+    const lNumberOfWords = (lNumberOfWords_temp2 + 1) * 16;
+    const lWordArray = new Array(lNumberOfWords).fill(0);
+    for (let i = 0; i < lMessageLength; i++) {
+      const wordIndex = i >> 2;
+      const bitOffset = (i % 4) * 8;
+      lWordArray[wordIndex] |= str.charCodeAt(i) << bitOffset;
     }
-    lWordCount = (lByteCount - (lByteCount % 4)) / 4;
-    lBytePosition = (lByteCount % 4) * 8;
-    lWordArray[lWordCount] = lWordArray[lWordCount] | (0x80 << lBytePosition);
-    lWordArray[lNumberOfWords - 2] = lMessageLength << 3;
-    lWordArray[lNumberOfWords - 1] = lMessageLength >>> 29;
+    const wordIndex = lMessageLength >> 2;
+    const bitOffset = (lMessageLength % 4) * 8;
+    lWordArray[wordIndex] |= 0x80 << bitOffset;
+    lWordArray[lNumberOfWords - 2] = (lMessageLength * 8) & 0xffffffff;
+    lWordArray[lNumberOfWords - 1] = Math.floor((lMessageLength * 8) / 0x100000000);
     return lWordArray;
   }
   function wordToHex(lValue) {
-    var WordToHexValue = "", WordToHexValue_temp = "", lByte, lCount;
-    for (lCount = 0; lCount <= 3; lCount++) {
-      lByte = (lValue >>> (lCount * 8)) & 255;
-      WordToHexValue_temp = "0" + lByte.toString(16);
-      WordToHexValue = WordToHexValue + WordToHexValue_temp.substr(WordToHexValue_temp.length - 2, 2);
+    let hex = "";
+    for (let i = 0; i < 4; i++) {
+      const b = (lValue >>> (i * 8)) & 255;
+      hex += b.toString(16).padStart(2, "0");
     }
-    return WordToHexValue;
+    return hex;
   }
 
-  var utf8Str = unescape(encodeURIComponent(string));
-  var x = convertToWordArray(utf8Str);
-  var a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
-  var S11 = 7, S12 = 12, S13 = 17, S14 = 22;
-  var S21 = 5, S22 = 9, S23 = 14, S24 = 20;
-  var S31 = 4, S32 = 11, S33 = 16, S34 = 23;
-  var S41 = 6, S42 = 10, S43 = 15, S44 = 21;
+  const utf8 = unescape(encodeURIComponent(string));
+  const x = convertToWordArray(utf8);
+  let a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
+  const S11 = 7, S12 = 12, S13 = 17, S14 = 22;
+  const S21 = 5, S22 = 9, S23 = 14, S24 = 20;
+  const S31 = 4, S32 = 11, S33 = 16, S34 = 23;
+  const S41 = 6, S42 = 10, S43 = 15, S44 = 21;
 
-  for (var k = 0; k < x.length; k += 16) {
-    var AA = a, BB = b, CC = c, DD = d;
+  for (let k = 0; k < x.length; k += 16) {
+    const AA = a, BB = b, CC = c, DD = d;
     a = FF(a, b, c, d, x[k + 0], S11, 0xd76aa478);
     d = FF(d, a, b, c, x[k + 1], S12, 0xe8c7b756);
     c = FF(c, d, a, b, x[k + 2], S13, 0x242070db);
@@ -140,6 +125,7 @@ function md5(string) {
     d = FF(d, a, b, c, x[k + 13], S12, 0xfd987193);
     c = FF(c, d, a, b, x[k + 14], S13, 0xa679438e);
     b = FF(b, c, d, a, x[k + 15], S14, 0x49b40821);
+
     a = GG(a, b, c, d, x[k + 1], S21, 0xf61e2562);
     d = GG(d, a, b, c, x[k + 6], S22, 0xc040b340);
     c = GG(c, d, a, b, x[k + 11], S23, 0x265e5a51);
@@ -156,6 +142,7 @@ function md5(string) {
     d = GG(d, a, b, c, x[k + 2], S22, 0xfcefa3f8);
     c = GG(c, d, a, b, x[k + 7], S23, 0x676f02d9);
     b = GG(b, c, d, a, x[k + 12], S24, 0x8d2a4c8a);
+
     a = HH(a, b, c, d, x[k + 5], S31, 0xfffa3942);
     d = HH(d, a, b, c, x[k + 8], S32, 0x8771f681);
     c = HH(c, d, a, b, x[k + 11], S33, 0x6d9d6122);
@@ -172,6 +159,7 @@ function md5(string) {
     d = HH(d, a, b, c, x[k + 12], S32, 0xe6db99e5);
     c = HH(c, d, a, b, x[k + 15], S33, 0x1fa27cf8);
     b = HH(b, c, d, a, x[k + 2], S34, 0xc4ac5665);
+
     a = II(a, b, c, d, x[k + 0], S41, 0xf4292244);
     d = II(d, a, b, c, x[k + 7], S42, 0x432aff97);
     c = II(c, d, a, b, x[k + 14], S43, 0xab9423a7);
@@ -188,6 +176,7 @@ function md5(string) {
     d = II(d, a, b, c, x[k + 11], S42, 0xbd3af235);
     c = II(c, d, a, b, x[k + 2], S43, 0x2ad7d2bb);
     b = II(b, c, d, a, x[k + 9], S44, 0xeb86d391);
+
     a = addUnsigned(a, AA);
     b = addUnsigned(b, BB);
     c = addUnsigned(c, CC);
@@ -196,14 +185,24 @@ function md5(string) {
   return (wordToHex(a) + wordToHex(b) + wordToHex(c) + wordToHex(d)).toLowerCase();
 }
 
+function md5(str) {
+  try {
+    return createHash("md5").update(str).digest("hex");
+  } catch (e) {
+    return pureJsMd5(str);
+  }
+}
+
 // ─── Cryptographic & Signing Helpers ─────────────────────────────────────────
 
 function generateSign(curTime) {
-  return md5(SECRET + deviceId + curTime).toUpperCase();
+  const hash = md5(SECRET + deviceId + curTime).toUpperCase();
+  return hash;
 }
 
 function generateP2pToken(vodId, curTime) {
-  return md5(P2P_SALT + deviceId + vodId + curTime).toUpperCase();
+  const hash = md5(P2P_SALT + deviceId + vodId + curTime).toUpperCase();
+  return hash;
 }
 
 function signVideoUrl(videoUrl) {
@@ -269,6 +268,7 @@ async function aesDecrypt(encryptedBase64) {
 // ─── Upstream API Helpers ─────────────────────────────────────────────────────
 
 function buildHeaders(curTime, token) {
+  const sign = generateSign(curTime);
   return {
     "Accept-Encoding": "identity",
     androidid: deviceId,
@@ -289,7 +289,7 @@ function buildHeaders(curTime, token) {
     mob_mfr: mobMfr,
     mobmodel: mobModel,
     package_name: PACKAGE_NAME,
-    sign: generateSign(curTime),
+    sign: sign,
     sys_platform: "2",
     sysrelease: "13",
     token: token || "",
@@ -306,7 +306,7 @@ async function httpsPost(endpoint, formData, headers) {
       params.append(k, v);
     }
 
-    console.log(`[UPSTREAM POST] ${MAIN_URL}${endpoint} (data keys: ${Object.keys(formData).join(", ")})`);
+    console.log(`[UPSTREAM POST] ${MAIN_URL}${endpoint} (sign: ${headers.sign})`);
     const res = await fetch(MAIN_URL + endpoint, {
       method: "POST",
       headers: headers,
@@ -328,7 +328,6 @@ async function httpsPost(endpoint, formData, headers) {
 
 async function fetchToken() {
   if (cachedToken) {
-    console.log(`[AUTH] Using cached session token (${cachedToken.substring(0, 8)}...)`);
     return cachedToken;
   }
 
@@ -554,15 +553,20 @@ function errorResponse(message, status = 400) {
 
 export default {
   async fetch(request, env = {}, ctx = {}) {
-    const startTime = Date.now();
     const url = new URL(request.url);
+    const rawPath = url.pathname;
+
+    // Fast return on favicon.ico
+    if (rawPath === "/favicon.ico") {
+      return new Response(null, { status: 204 });
+    }
+
     console.log(`[REQ] ${request.method} ${url.pathname}${url.search}`);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    const rawPath = url.pathname;
     let cleanPath = rawPath.replace(/^\/+|\/+$/g, "");
     if (cleanPath.startsWith("api/")) {
       cleanPath = cleanPath.slice(4);
