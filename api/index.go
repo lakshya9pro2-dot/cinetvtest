@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -76,12 +77,15 @@ func init() {
 }
 
 type TmdbInfo struct {
-	ID      int    `json:"id"`
-	Title   string `json:"title"`
-	Year    string `json:"year"`
-	Type    string `json:"type"`
-	Season  *int   `json:"season,omitempty"`
-	Episode *int   `json:"episode,omitempty"`
+	ID          int    `json:"id"`
+	Title       string `json:"title"`
+	Year        string `json:"year"`
+	Type        string `json:"type"`
+	Season      *int   `json:"season,omitempty"`
+	Episode     *int   `json:"episode,omitempty"`
+	SeasonName  string `json:"season_name,omitempty"`
+	SeasonYear  string `json:"season_year,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 func md5Hex(text string) string {
@@ -454,6 +458,119 @@ func parseTmdbMap(data map[string]interface{}, mediaType string) *TmdbInfo {
 	}
 }
 
+func fetchTmdbTvDetails(id string, season string) *TmdbInfo {
+	apiKey := getTmdbApiKey()
+	log.Printf("[TMDB] Fetching TV show and Season %s details for ID: %s", season, id)
+	realId := id
+	if strings.HasPrefix(id, "tt") {
+		findURL := fmt.Sprintf("https://api.themoviedb.org/3/find/%s?api_key=%s&external_source=imdb_id", id, apiKey)
+		jsonStr := httpGet(findURL, nil)
+		if jsonStr != "" {
+			var findRes map[string]interface{}
+			json.Unmarshal([]byte(jsonStr), &findRes)
+			if tvResults, ok := findRes["tv_results"].([]interface{}); ok && len(tvResults) > 0 {
+				if first, ok := tvResults[0].(map[string]interface{}); ok {
+					if fid, ok := first["id"].(float64); ok {
+						realId = strconv.Itoa(int(fid))
+						log.Printf("[TMDB] Resolved IMDb %s to TMDB ID %s", id, realId)
+					}
+				}
+			}
+		}
+	}
+
+	reqURL := fmt.Sprintf("https://api.themoviedb.org/3/tv/%s?api_key=%s", realId, apiKey)
+	jsonStr := httpGet(reqURL, nil)
+	if jsonStr == "" {
+		log.Printf("[TMDB ERROR] Could not fetch TV show for ID: %s", realId)
+		return nil
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return nil
+	}
+
+	idVal, _ := data["id"].(float64)
+	showTitle, _ := data["name"].(string)
+	if showTitle == "" {
+		showTitle, _ = data["original_name"].(string)
+	}
+
+	showDate, _ := data["first_air_date"].(string)
+	showYear := showDate
+	if strings.Contains(showDate, "-") {
+		showYear = strings.Split(showDate, "-")[0]
+	}
+
+	seasonNum, _ := strconv.Atoi(season)
+	var seasonName, seasonYear, seasonDesc string
+
+	if seasons, ok := data["seasons"].([]interface{}); ok {
+		for _, sIntf := range seasons {
+			if s, ok := sIntf.(map[string]interface{}); ok {
+				sNum := 0
+				if snf, ok := s["season_number"].(float64); ok {
+					sNum = int(snf)
+				}
+				if sNum == seasonNum {
+					seasonName, _ = s["name"].(string)
+					seasonDesc, _ = s["overview"].(string)
+					sDate, _ := s["air_date"].(string)
+					if strings.Contains(sDate, "-") {
+						seasonYear = strings.Split(sDate, "-")[0]
+					} else {
+						seasonYear = sDate
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// Fallback to fetch season endpoint if overview or air date is empty
+	if (seasonDesc == "" || seasonYear == "") && realId != "" && season != "" {
+		sURL := fmt.Sprintf("https://api.themoviedb.org/3/tv/%s/season/%s?api_key=%s", realId, season, apiKey)
+		sJson := httpGet(sURL, nil)
+		if sJson != "" {
+			var sData map[string]interface{}
+			if err := json.Unmarshal([]byte(sJson), &sData); err == nil {
+				if seasonDesc == "" {
+					seasonDesc, _ = sData["overview"].(string)
+				}
+				if seasonYear == "" {
+					sDate, _ := sData["air_date"].(string)
+					if strings.Contains(sDate, "-") {
+						seasonYear = strings.Split(sDate, "-")[0]
+					} else {
+						seasonYear = sDate
+					}
+				}
+			}
+		}
+	}
+
+	if seasonYear == "" {
+		seasonYear = showYear
+	}
+	if seasonName == "" {
+		seasonName = fmt.Sprintf("Season %s", season)
+	}
+
+	log.Printf("[TMDB SUCCESS] TV '%s' Season %s -> Year: %s, Desc: '%.60s...'", showTitle, season, seasonYear, seasonDesc)
+
+	return &TmdbInfo{
+		ID:          int(idVal),
+		Title:       showTitle,
+		Year:        showYear,
+		SeasonYear:  seasonYear,
+		SeasonName:  seasonName,
+		Description: seasonDesc,
+		Type:        "tv",
+		Season:      &seasonNum,
+	}
+}
+
 func fetchTmdbDetails(id string, mediaType string) *TmdbInfo {
 	apiKey := getTmdbApiKey()
 	log.Printf("[TMDB] Fetching details for %s ID: %s", mediaType, id)
@@ -541,6 +658,235 @@ func extractVodId(response map[string]interface{}) string {
 		}
 	}
 	return ""
+}
+
+func extractCandidates(response map[string]interface{}) []map[string]interface{} {
+	var candidates []map[string]interface{}
+	if response == nil {
+		return candidates
+	}
+	if items, ok := response["result"].([]interface{}); ok {
+		for _, it := range items {
+			if m, ok := it.(map[string]interface{}); ok {
+				candidates = append(candidates, m)
+			}
+		}
+	} else if resultMap, ok := response["result"].(map[string]interface{}); ok {
+		if items, ok := resultMap["items"].([]interface{}); ok {
+			for _, it := range items {
+				if m, ok := it.(map[string]interface{}); ok {
+					candidates = append(candidates, m)
+				}
+			}
+		}
+	}
+	return candidates
+}
+
+func normalizeCleanText(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == ' ' {
+			b.WriteRune(r)
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+func calcWordOverlap(s1, s2 string) float64 {
+	w1 := strings.Fields(normalizeCleanText(s1))
+	w2 := strings.Fields(normalizeCleanText(s2))
+	if len(w1) == 0 || len(w2) == 0 {
+		return 0.0
+	}
+	set1 := make(map[string]bool)
+	for _, w := range w1 {
+		if len(w) > 3 {
+			set1[w] = true
+		}
+	}
+	if len(set1) == 0 {
+		return 0.0
+	}
+	matches := 0
+	for _, w := range w2 {
+		if len(w) > 3 && set1[w] {
+			matches++
+		}
+	}
+	return float64(matches) / float64(len(set1))
+}
+
+type tvCandidate struct {
+	idStr      string
+	item       map[string]interface{}
+	score      int
+	vodDetails map[string]interface{}
+}
+
+func findBestMatchingTvVod(items []map[string]interface{}, showTitle, season, seasonYear, seasonDesc string) (string, map[string]interface{}) {
+	if len(items) == 0 {
+		return "", nil
+	}
+
+	normShow := normalizeCleanText(showTitle)
+	normSeasonStr := "season " + season
+	normTarget := normalizeCleanText(fmt.Sprintf("%s Season %s", showTitle, season))
+
+	var candidates []tvCandidate
+	for _, item := range items {
+		name, _ := item["vod_name"].(string)
+		year, _ := item["vod_year"].(string)
+		var idStr string
+		if idFloat, ok := item["id"].(float64); ok {
+			idStr = strconv.FormatFloat(idFloat, 'f', -1, 64)
+		} else if idS, ok := item["id"].(string); ok {
+			idStr = idS
+		}
+		if idStr == "" {
+			continue
+		}
+
+		score := 0
+		normName := normalizeCleanText(name)
+
+		// 1. Name matching
+		if normName == normTarget {
+			score += 100
+		} else if strings.HasPrefix(normName, normShow) && strings.Contains(normName, normSeasonStr) {
+			score += 70
+			// Penalize extra subtitles (e.g. "Dexter: Resurrection" vs "Dexter")
+			cleaned := strings.TrimSpace(strings.Replace(strings.Replace(normName, normShow, "", 1), normSeasonStr, "", 1))
+			if len(cleaned) > 0 {
+				score -= 40
+			}
+		} else if strings.Contains(normName, normShow) {
+			score += 20
+		}
+
+		// 2. Year matching
+		if year != "" && seasonYear != "" {
+			candYear, err1 := strconv.Atoi(year)
+			targetYear, err2 := strconv.Atoi(seasonYear)
+			if err1 == nil && err2 == nil {
+				diff := int(math.Abs(float64(candYear - targetYear)))
+				if diff == 0 {
+					score += 80
+				} else if diff == 1 {
+					score += 30
+				} else {
+					score -= 100 // heavy penalty for year mismatch
+				}
+			}
+		}
+
+		candidates = append(candidates, tvCandidate{
+			idStr: idStr,
+			item:  item,
+			score: score,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return "", nil
+	}
+
+	// Sort candidates by score descending
+	for i := 0; i < len(candidates)-1; i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].score > candidates[i].score {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+
+	// Evaluate top candidates (up to 3) by checking vodDetails (blurb and series_info)
+	checkLimit := min(3, len(candidates))
+	var bestCandidate *tvCandidate
+
+	for i := 0; i < checkLimit; i++ {
+		c := &candidates[i]
+		log.Printf("[TV CANDIDATE] #%d: ID %s (%s, %s) -> Base Score: %d", i+1, c.idStr, c.item["vod_name"], c.item["vod_year"], c.score)
+
+		details := getVodInfo(c.idStr, 0)
+		if details == nil {
+			continue
+		}
+		c.vodDetails = details
+
+		if resObj, ok := details["result"].(map[string]interface{}); ok {
+			// Check series_info for exact season mapping
+			if seriesInfo, ok := resObj["series_info"].([]interface{}); ok {
+				for _, sMap := range seriesInfo {
+					if sm, ok := sMap.(map[string]interface{}); ok {
+						seriesName, _ := sm["series"].(string)
+						if strings.EqualFold(strings.TrimSpace(seriesName), "Season "+season) {
+							if sidFloat, ok := sm["vod_id"].(float64); ok {
+								exactId := strconv.FormatFloat(sidFloat, 'f', -1, 64)
+								if exactId != c.idStr {
+									log.Printf("[TV SERIES_INFO] Found exact season VOD ID %s in series_info", exactId)
+									exactDetails := getVodInfo(exactId, 0)
+									if exactDetails != nil {
+										c.idStr = exactId
+										c.vodDetails = exactDetails
+										c.score += 100
+									}
+								} else {
+									c.score += 80
+								}
+								break
+							}
+						}
+					}
+				}
+			}
+
+			// Verify description / blurb
+			blurb, _ := resObj["vod_blurb"].(string)
+			if blurb != "" && seasonDesc != "" {
+				overlap := calcWordOverlap(seasonDesc, blurb)
+				log.Printf("[TV BLURB VERIFY] ID %s Description overlap: %.2f", c.idStr, overlap)
+				if overlap >= 0.25 {
+					c.score += 150
+				} else if overlap >= 0.10 {
+					c.score += 50
+				}
+			}
+
+			// Verify detail vod_year if search item had empty year
+			detailYear, _ := resObj["vod_year"].(string)
+			if detailYear != "" && seasonYear != "" {
+				cYear, err1 := strconv.Atoi(detailYear)
+				tYear, err2 := strconv.Atoi(seasonYear)
+				if err1 == nil && err2 == nil {
+					diff := int(math.Abs(float64(cYear - tYear)))
+					if diff == 0 {
+						c.score += 30
+					} else if diff > 1 {
+						c.score -= 80
+					}
+				}
+			}
+		}
+
+		if bestCandidate == nil || c.score > bestCandidate.score {
+			bestCandidate = c
+		}
+	}
+
+	if bestCandidate == nil || bestCandidate.score <= 0 {
+		if len(candidates) > 0 {
+			first := &candidates[0]
+			if first.vodDetails == nil {
+				first.vodDetails = getVodInfo(first.idStr, 0)
+			}
+			return first.idStr, first.vodDetails
+		}
+		return "", nil
+	}
+
+	log.Printf("[TV MATCH WINNER] Selected VOD ID: %s (Score: %d)", bestCandidate.idStr, bestCandidate.score)
+	return bestCandidate.idStr, bestCandidate.vodDetails
 }
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -693,50 +1039,63 @@ func handleMovieWithID(w http.ResponseWriter, r *http.Request, id string) {
 func handleTvWithParams(w http.ResponseWriter, r *http.Request, id, season string, episode int) {
 	log.Printf("[TV] Processing request for TV ID: %s, Season: %s, Episode: %d", id, season, episode)
 
-	// 1. Get TMDB Details
-	tmdb := fetchTmdbDetails(id, "tv")
+	// 1. Get TMDB Details with Season-specific Year and Description
+	tmdb := fetchTmdbTvDetails(id, season)
 	if tmdb == nil {
 		writeJSONError(w, http.StatusNotFound, "TMDB info not found")
 		return
 	}
 
-	// 2. Search for the title + season
-	searchQuery := fmt.Sprintf("%s Season %s", tmdb.Title, season)
-	log.Printf("[TV SEARCH] Querying upstream for '%s'...", searchQuery)
+	// 2. Search for the title + season (e.g. "The Mentalist - Season 1")
+	searchQuery := fmt.Sprintf("%s - Season %s", tmdb.Title, season)
+	log.Printf("[TV SEARCH] Primary query: '%s'...", searchQuery)
 	res := apiPost("/api/search/result", map[string]string{"kw": searchQuery, "pn": "1"})
-	vodId := extractVodId(res)
+	candidates := extractCandidates(res)
 
-	// Fallback search to just the title
-	if vodId == "" {
-		log.Printf("[TV FALLBACK] Retrying search with title only: '%s'...", tmdb.Title)
-		res = apiPost("/api/search/result", map[string]string{"kw": tmdb.Title, "pn": "1"})
-		vodId = extractVodId(res)
+	// Fallback 1: Retrying without hyphen (e.g. "The Mentalist Season 1")
+	if len(candidates) == 0 {
+		searchQuery2 := fmt.Sprintf("%s Season %s", tmdb.Title, season)
+		log.Printf("[TV FALLBACK 1] Retrying search with: '%s'...", searchQuery2)
+		res = apiPost("/api/search/result", map[string]string{"kw": searchQuery2, "pn": "1"})
+		candidates = extractCandidates(res)
 	}
 
-	if vodId == "" {
-		log.Printf("[TV NOT FOUND] Upstream search returned no results for '%s'", searchQuery)
+	// Fallback 2: Retrying with title only
+	if len(candidates) == 0 {
+		log.Printf("[TV FALLBACK 2] Retrying search with title only: '%s'...", tmdb.Title)
+		res = apiPost("/api/search/result", map[string]string{"kw": tmdb.Title, "pn": "1"})
+		candidates = extractCandidates(res)
+	}
+
+	if len(candidates) == 0 {
+		log.Printf("[TV NOT FOUND] Upstream search returned no results for '%s'", tmdb.Title)
 		writeJSONError(w, http.StatusNotFound, "Video not found on server")
 		return
 	}
 
-	// 3. Get Vod Info and extract signed URL for the specific episode
+	// 3. Find the best matching VOD by validating Season Name, Year, and Description
+	vodId, vodDetails := findBestMatchingTvVod(candidates, tmdb.Title, season, tmdb.SeasonYear, tmdb.Description)
+	if vodId == "" || vodDetails == nil {
+		log.Printf("[TV NOT FOUND] No matching VOD verified for '%s' Season %s", tmdb.Title, season)
+		writeJSONError(w, http.StatusNotFound, "Video not found on server")
+		return
+	}
+
+	// 4. Extract signed URL for the specific episode
 	log.Printf("[TV FOUND] Upstream VOD ID: %s. Resolving episode %d...", vodId, episode)
-	vodDetails := getVodInfo(vodId, 0)
 	var signedUrl string
-	if vodDetails != nil {
-		if result, ok := vodDetails["result"].(map[string]interface{}); ok {
-			if collections, ok := result["vod_collection"].([]interface{}); ok {
-				for _, epIntf := range collections {
-					if ep, ok := epIntf.(map[string]interface{}); ok {
-						colNum := 0
-						if colFloat, ok := ep["collection"].(float64); ok {
-							colNum = int(colFloat)
-						}
-						if colNum == episode {
-							if u, ok := ep["signed_url"].(string); ok {
-								signedUrl = u
-								break
-							}
+	if result, ok := vodDetails["result"].(map[string]interface{}); ok {
+		if collections, ok := result["vod_collection"].([]interface{}); ok {
+			for _, epIntf := range collections {
+				if ep, ok := epIntf.(map[string]interface{}); ok {
+					colNum := 0
+					if colFloat, ok := ep["collection"].(float64); ok {
+						colNum = int(colFloat)
+					}
+					if colNum == episode {
+						if u, ok := ep["signed_url"].(string); ok {
+							signedUrl = u
+							break
 						}
 					}
 				}
@@ -752,11 +1111,13 @@ func handleTvWithParams(w http.ResponseWriter, r *http.Request, id, season strin
 
 	log.Printf("[TV SUCCESS] Resolved stream URL for '%s' S%sE%d", tmdb.Title, season, episode)
 	response := map[string]string{
-		"id":      id,
-		"name":    tmdb.Title,
-		"season":  season,
-		"episode": strconv.Itoa(episode),
-		"url":     signedUrl,
+		"id":          id,
+		"name":        tmdb.Title,
+		"season":      season,
+		"episode":     strconv.Itoa(episode),
+		"season_year": tmdb.SeasonYear,
+		"description": tmdb.Description,
+		"url":         signedUrl,
 	}
 	writeJSON(w, http.StatusOK, response)
 }

@@ -450,7 +450,256 @@ function extractVodId(res) {
   return "";
 }
 
+function extractCandidates(res) {
+  if (!res) return [];
+  if (Array.isArray(res.result)) {
+    return res.result.filter((it) => it && typeof it === "object");
+  }
+  if (Array.isArray(res.result?.items)) {
+    return res.result.items.filter((it) => it && typeof it === "object");
+  }
+  return [];
+}
+
+function normalizeCleanText(s) {
+  if (!s) return "";
+  return s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function calcWordOverlap(s1, s2) {
+  const w1 = normalizeCleanText(s1).split(" ").filter((w) => w.length > 3);
+  const w2 = normalizeCleanText(s2).split(" ").filter((w) => w.length > 3);
+  if (w1.length === 0 || w2.length === 0) return 0.0;
+  const set1 = new Set(w1);
+  let matches = 0;
+  for (const w of w2) {
+    if (set1.has(w)) matches++;
+  }
+  return matches / set1.size;
+}
+
 // ─── TMDB Metadata Helpers ───────────────────────────────────────────────────
+
+async function fetchTmdbTvDetails(id, season, apiKey) {
+  const key = apiKey || DEFAULT_TMDB_KEY;
+  console.log(`[TMDB] Fetching TV show and Season ${season} details for ID: ${id}...`);
+  let realId = id;
+  if (id.startsWith("tt")) {
+    const findUrl = `https://api.themoviedb.org/3/find/${id}?api_key=${key}&external_source=imdb_id`;
+    try {
+      const resp = await fetch(findUrl, { headers: { "User-Agent": USER_AGENT } });
+      if (resp.ok) {
+        const findRes = await resp.json();
+        const tvResults = findRes.tv_results || [];
+        if (tvResults.length > 0 && tvResults[0].id) {
+          realId = tvResults[0].id.toString();
+          console.log(`[TMDB] Resolved IMDb ${id} to TMDB ID ${realId}`);
+        }
+      }
+    } catch (e) {
+      console.error(`[TMDB ERROR] IMDb lookup failed:`, e.message);
+    }
+  }
+
+  const reqUrl = `https://api.themoviedb.org/3/tv/${realId}?api_key=${key}`;
+  try {
+    const resp = await fetch(reqUrl, { headers: { "User-Agent": USER_AGENT } });
+    if (!resp.ok) {
+      console.error(`[TMDB ERROR] TV lookup failed HTTP ${resp.status}`);
+      return null;
+    }
+    const data = await resp.json();
+    const showTitle = data.name || data.original_name || "";
+    const showDate = data.first_air_date || "";
+    const showYear = showDate.includes("-") ? showDate.split("-")[0] : showDate;
+
+    const seasonNum = parseInt(season, 10);
+    let seasonName = "";
+    let seasonYear = "";
+    let seasonDesc = "";
+
+    if (Array.isArray(data.seasons)) {
+      for (const s of data.seasons) {
+        if (s.season_number === seasonNum) {
+          seasonName = s.name || "";
+          seasonDesc = s.overview || "";
+          if (s.air_date) {
+            seasonYear = s.air_date.includes("-") ? s.air_date.split("-")[0] : s.air_date;
+          }
+          break;
+        }
+      }
+    }
+
+    if ((!seasonDesc || !seasonYear) && realId && season) {
+      try {
+        const sUrl = `https://api.themoviedb.org/3/tv/${realId}/season/${season}?api_key=${key}`;
+        const sResp = await fetch(sUrl, { headers: { "User-Agent": USER_AGENT } });
+        if (sResp.ok) {
+          const sData = await sResp.json();
+          if (!seasonDesc && sData.overview) seasonDesc = sData.overview;
+          if (!seasonYear && sData.air_date) {
+            seasonYear = sData.air_date.includes("-") ? sData.air_date.split("-")[0] : sData.air_date;
+          }
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+
+    if (!seasonYear) seasonYear = showYear;
+    if (!seasonName) seasonName = `Season ${season}`;
+
+    console.log(`[TMDB SUCCESS] TV "${showTitle}" Season ${season} -> Year: ${seasonYear}, Desc: "${seasonDesc.substring(0, 60)}..."`);
+    return {
+      id: data.id,
+      title: showTitle,
+      year: showYear,
+      seasonYear: seasonYear,
+      seasonName: seasonName,
+      description: seasonDesc,
+      type: "tv",
+      season: seasonNum,
+    };
+  } catch (e) {
+    console.error(`[TMDB ERROR] TV details lookup failed:`, e.message);
+    return null;
+  }
+}
+
+async function findBestMatchingTvVod(items, showTitle, season, seasonYear, seasonDesc) {
+  if (!items || items.length === 0) return { vodId: "", vodDetails: null };
+
+  const normShow = normalizeCleanText(showTitle);
+  const normSeasonStr = `season ${season}`;
+  const normTarget = normalizeCleanText(`${showTitle} Season ${season}`);
+
+  const candidates = [];
+  for (const item of items) {
+    const name = item.vod_name || "";
+    const year = (item.vod_year || "").toString();
+    const idStr = (item.id != null ? item.id : "").toString();
+    if (!idStr) continue;
+
+    let score = 0;
+    const normName = normalizeCleanText(name);
+
+    // 1. Name match
+    if (normName === normTarget) {
+      score += 100;
+    } else if (normName.startsWith(normShow) && normName.includes(normSeasonStr)) {
+      score += 70;
+      const cleaned = normName.replace(normShow, "").replace(normSeasonStr, "").trim();
+      if (cleaned.length > 0) {
+        score -= 40; // penalty for extra subtitle like "Resurrection"
+      }
+    } else if (normName.includes(normShow)) {
+      score += 20;
+    }
+
+    // 2. Year match
+    if (year && seasonYear) {
+      const candYear = parseInt(year, 10);
+      const targetYear = parseInt(seasonYear, 10);
+      if (!isNaN(candYear) && !isNaN(targetYear)) {
+        const diff = Math.abs(candYear - targetYear);
+        if (diff === 0) {
+          score += 80;
+        } else if (diff === 1) {
+          score += 30;
+        } else {
+          score -= 100; // heavy penalty for year mismatch
+        }
+      }
+    }
+
+    candidates.push({ idStr, item, score, vodDetails: null });
+  }
+
+  if (candidates.length === 0) return { vodId: "", vodDetails: null };
+
+  // Sort descending by score
+  candidates.sort((a, b) => b.score - a.score);
+
+  const checkLimit = Math.min(3, candidates.length);
+  let bestCandidate = null;
+
+  for (let i = 0; i < checkLimit; i++) {
+    const c = candidates[i];
+    console.log(`[TV CANDIDATE] #${i + 1}: ID ${c.idStr} (${c.item.vod_name}, ${c.item.vod_year}) -> Base Score: ${c.score}`);
+
+    const details = await getVodInfo(c.idStr, 0);
+    if (!details) continue;
+    c.vodDetails = details;
+
+    const resObj = details.result;
+    if (resObj) {
+      // Check series_info for exact season mapping
+      if (Array.isArray(resObj.series_info)) {
+        for (const sMap of resObj.series_info) {
+          const seriesName = (sMap.series || "").trim().toLowerCase();
+          if (seriesName === `season ${season}`) {
+            const sid = (sMap.vod_id != null ? sMap.vod_id : "").toString();
+            if (sid && sid !== c.idStr) {
+              console.log(`[TV SERIES_INFO] Found exact season VOD ID ${sid} in series_info`);
+              const exactDetails = await getVodInfo(sid, 0);
+              if (exactDetails) {
+                c.idStr = sid;
+                c.vodDetails = exactDetails;
+                c.score += 100;
+              }
+            } else {
+              c.score += 80;
+            }
+            break;
+          }
+        }
+      }
+
+      // Verify description / blurb
+      const blurb = resObj.vod_blurb || "";
+      if (blurb && seasonDesc) {
+        const overlap = calcWordOverlap(seasonDesc, blurb);
+        console.log(`[TV BLURB VERIFY] ID ${c.idStr} Description overlap: ${overlap.toFixed(2)}`);
+        if (overlap >= 0.25) {
+          c.score += 150;
+        } else if (overlap >= 0.10) {
+          c.score += 50;
+        }
+      }
+
+      // Verify detail year if search item had empty year
+      const detailYear = (resObj.vod_year || "").toString();
+      if (detailYear && seasonYear) {
+        const cYear = parseInt(detailYear, 10);
+        const tYear = parseInt(seasonYear, 10);
+        if (!isNaN(cYear) && !isNaN(tYear)) {
+          const diff = Math.abs(cYear - tYear);
+          if (diff === 0) c.score += 30;
+          else if (diff > 1) c.score -= 80;
+        }
+      }
+    }
+
+    if (!bestCandidate || c.score > bestCandidate.score) {
+      bestCandidate = c;
+    }
+  }
+
+  if (!bestCandidate || bestCandidate.score <= 0) {
+    if (candidates.length > 0) {
+      const first = candidates[0];
+      if (!first.vodDetails) {
+        first.vodDetails = await getVodInfo(first.idStr, 0);
+      }
+      return { vodId: first.idStr, vodDetails: first.vodDetails };
+    }
+    return { vodId: "", vodDetails: null };
+  }
+
+  console.log(`[TV MATCH WINNER] Selected VOD ID: ${bestCandidate.idStr} (Score: ${bestCandidate.score})`);
+  return { vodId: bestCandidate.idStr, vodDetails: bestCandidate.vodDetails };
+}
 
 function parseTmdbMap(data, mediaType) {
   const title = data.title || data.name || data.original_title || data.original_name || "";
@@ -712,31 +961,54 @@ async function handleMovieRequest(id, tmdbApiKey) {
 
 async function handleTvRequest(id, season, episode, tmdbApiKey) {
   console.log(`[TV] Resolving stream for TV show ID: ${id}, Season ${season}, Episode ${episode}`);
-  const tmdb = await fetchTmdbDetails(id, "tv", tmdbApiKey);
+  const tmdb = await fetchTmdbTvDetails(id, season, tmdbApiKey);
   if (!tmdb) {
     console.error(`[TV ERROR] TMDB details not found for TV ID: ${id}`);
     return errorResponse("TMDB info not found", 404);
   }
 
-  const title = tmdb.Title || tmdb.title;
-  const searchQuery = `${title} Season ${season}`;
-  console.log(`[TV SEARCH] Querying upstream for: "${searchQuery}"`);
+  const title = tmdb.title;
+  // 1. Primary search: "{title} - Season {season}"
+  const searchQuery = `${title} - Season ${season}`;
+  console.log(`[TV SEARCH] Primary search query: "${searchQuery}"`);
   let res = await apiPost("/api/search/result", { kw: searchQuery, pn: "1" });
-  let vodId = extractVodId(res);
+  let candidates = extractCandidates(res);
 
-  if (!vodId) {
-    console.log(`[TV FALLBACK] Retrying search with title only: "${title}"`);
-    res = await apiPost("/api/search/result", { kw: title, pn: "1" });
-    vodId = extractVodId(res);
+  // Fallback 1: "{title} Season {season}"
+  if (candidates.length === 0) {
+    const searchQuery2 = `${title} Season ${season}`;
+    console.log(`[TV FALLBACK 1] Retrying search with: "${searchQuery2}"`);
+    res = await apiPost("/api/search/result", { kw: searchQuery2, pn: "1" });
+    candidates = extractCandidates(res);
   }
 
-  if (!vodId) {
-    console.warn(`[TV NOT FOUND] Upstream search returned no results for "${searchQuery}"`);
+  // Fallback 2: title only
+  if (candidates.length === 0) {
+    console.log(`[TV FALLBACK 2] Retrying search with title only: "${title}"`);
+    res = await apiPost("/api/search/result", { kw: title, pn: "1" });
+    candidates = extractCandidates(res);
+  }
+
+  if (candidates.length === 0) {
+    console.warn(`[TV NOT FOUND] Upstream search returned no results for "${title}"`);
+    return errorResponse("Video not found on server", 404);
+  }
+
+  // Find best matching VOD with season, year, and description verification
+  const { vodId, vodDetails } = await findBestMatchingTvVod(
+    candidates,
+    title,
+    season,
+    tmdb.seasonYear,
+    tmdb.description
+  );
+
+  if (!vodId || !vodDetails) {
+    console.warn(`[TV NOT FOUND] No matching VOD verified for "${title}" Season ${season}`);
     return errorResponse("Video not found on server", 404);
   }
 
   console.log(`[TV FOUND] Upstream VOD ID: ${vodId}. Fetching episode ${episode}...`);
-  const vodDetails = await getVodInfo(vodId, 0);
   let signedUrl = "";
   if (vodDetails?.result?.vod_collection) {
     for (const ep of vodDetails.result.vod_collection) {
@@ -759,6 +1031,8 @@ async function handleTvRequest(id, season, episode, tmdbApiKey) {
     name: title,
     season: season,
     episode: episode.toString(),
+    season_year: tmdb.seasonYear,
+    description: tmdb.description,
     url: signedUrl,
   });
 }
